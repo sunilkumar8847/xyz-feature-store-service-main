@@ -1,0 +1,112 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "feature-store-service"
+version = "3.0.0"
+description = "XYZ MDM 3.0 - Feature Store Service: Centralized feature management for ML models"
+requires-python = ">=3.11"
+dependencies = [
+    # Web Framework — standardized versions
+    "fastapi==0.111.0",
+    "uvicorn[standard]==0.30.0",
+    "gunicorn==21.2.0",
+    # Pydantic v2 — standardized versions
+    "pydantic==2.7.0",
+    "pydantic-settings==2.3.0",
+    # Database & ORM
+    "sqlalchemy[asyncio]==2.0.25",
+    "alembic==1.13.1",
+    "asyncpg==0.29.0",
+    "psycopg2-binary==2.9.9",
+    # Redis (Online Store)
+    "redis[hiredis]==5.0.1",
+    # Kafka (Streaming)
+    "confluent-kafka==2.3.0",
+    # AWS S3 (Offline Store)
+    "boto3==1.34.14",
+    "botocore==1.34.14",
+    # Feature Computation
+    "jellyfish==1.0.3",
+    "rapidfuzz==3.6.1",
+
+    "numpy==1.26.3",
+    "scipy==1.11.4",
+    "scikit-learn==1.4.0",
+    # NOTE: relaxed from torch==2.1.2 / sentence-transformers==2.2.2 — those have
+    # no Python 3.12 wheels. These 3.12-compatible versions match the training venv.
+    "sentence-transformers>=2.7.0,<3.0.0",
+    "torch>=2.2.0,<2.4.0",
+    # Parquet (Offline Store)
+    "pyarrow==14.0.2",
+    "pandas==2.1.4",
+    # relaxed from ==2023.10.1 (no 3.12 wheel; source build fails). pyarrow also handles parquet.
+    "fastparquet>=2024.5.0",
+    # Scheduling
+    "apscheduler==3.10.4",
+    # Observability
+    "prometheus-client==0.19.0",
+    "opentelemetry-api==1.22.0",
+    "opentelemetry-sdk==1.22.0",
+    "opentelemetry-instrumentation-fastapi==0.43b0",
+    "opentelemetry-exporter-otlp==1.22.0",
+    "structlog==24.1.0",
+    # HTTP Client
+    "httpx==0.26.0",
+    "tenacity==8.2.3",
+    # Utilities
+    "python-multipart==0.0.9",
+    "python-dotenv==1.0.0",
+    "orjson==3.9.12",
+    "xxhash==3.4.1",
+    "protobuf==4.25.2",
+    "msgpack==1.0.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==7.4.4",
+    "pytest-asyncio==0.23.3",
+    "pytest-cov==4.1.0",
+    "pytest-mock==3.12.0",
+    "httpx==0.26.0",
+    "factory-boy==3.3.0",
+    "faker==22.0.0",
+    "ruff==0.1.9",
+    "mypy==1.8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--cov=src --cov-report=term-missing --cov-fail-under=70"
+
+[tool.coverage.run]
+omit = [
+    "src/main.py",
+    "src/core/config.py",
+    "src/core/dependencies.py",
+    "src/core/metrics.py",
+    "src/auth/*",
+    "src/repositories/offline_store.py",
+    "src/repositories/online_store.py",
+    "src/repositories/feature_registry.py",
+    "src/workers/streaming_ingest.py",
+    "src/workers/materialization.py",
+    "src/api/v1/endpoints/features.py",
+    "src/services/feature_store.py",
+    "tests/*",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true

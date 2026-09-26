@@ -1,0 +1,154 @@
+version: "3.9"
+
+services:
+  # ─── Feature Store Service ────────────────────────────────────────────────
+  feature-store:
+    build:
+      context: .
+      target: production
+    container_name: feature-store-service
+    ports:
+      - "8006:8006"
+      - "9090:9090"
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      KAFKA_BROKERS: kafka:9092
+      S3_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      ENVIRONMENT: development
+      API_RELOAD: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8006/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - mdm-network
+
+  # ─── PostgreSQL (Feature Registry) ───────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: feature-store-postgres
+    ports:
+      - "5435:5432"
+    environment:
+      POSTGRES_DB: feature_store
+      POSTGRES_USER: feature_store_user
+      POSTGRES_PASSWORD: feature_store_pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U feature_store_user -d feature_store"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mdm-network
+
+  # ─── Redis (Online Store) ─────────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: feature-store-redis
+    ports:
+      - "6382:6379"
+    command: redis-server --maxmemory 2gb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mdm-network
+
+  # ─── Kafka (Streaming Ingest) ─────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: feature-store-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - mdm-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: feature-store-kafka
+    ports:
+      - "9096:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9096
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    depends_on:
+      - zookeeper
+    networks:
+      - mdm-network
+
+  # ─── LocalStack (S3 mock) ─────────────────────────────────────────────────
+  localstack:
+    image: localstack/localstack:3.0
+    container_name: feature-store-localstack
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3
+      DEFAULT_REGION: us-east-1
+      EAGER_SERVICE_LOADING: 1
+    volumes:
+      - localstack_data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mdm-network
+
+  # ─── Init: Create S3 bucket ───────────────────────────────────────────────
+  localstack-init:
+    image: amazon/aws-cli:latest
+    container_name: feature-store-localstack-init
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    command: >
+      s3api create-bucket
+        --bucket xyz-mdm-feature-store
+        --endpoint-url http://localstack:4566
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - mdm-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  localstack_data:
+
+networks:
+  mdm-network:
+    driver: bridge
+    name: mdm-network
+    external: false
