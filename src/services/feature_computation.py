@@ -29,6 +29,7 @@ from rapidfuzz import fuzz, distance
 
 from src.domain.models import EntitySnapshot, FeatureVector
 from src.core.config import settings
+from src.core.metrics import PHONETIC_ENCODER_FALLBACKS
 
 logger = logging.getLogger(__name__)
 
@@ -181,45 +182,69 @@ class PhoneticFeatures:
         first1 = letters_only(n1.split()[0]) if n1.split() else ""
         first2 = letters_only(n2.split()[0]) if n2.split() else ""
 
-        def soundex_match(s1: str, s2: str) -> float:
-            if not s1 or not s2:
-                return 0.0
-            try:
-                return 1.0 if jellyfish.soundex(s1) == jellyfish.soundex(s2) else 0.0
-            except Exception:
-                return 0.0
-
-        def metaphone_match(s1: str, s2: str) -> float:
-            if not s1 or not s2:
-                return 0.0
-            try:
-                return 1.0 if jellyfish.metaphone(s1) == jellyfish.metaphone(s2) else 0.0
-            except Exception:
-                return 0.0
-
-        def nysiis_match(s1: str, s2: str) -> float:
-            if not s1 or not s2:
-                return 0.0
-            try:
-                return 1.0 if jellyfish.nysiis(s1) == jellyfish.nysiis(s2) else 0.0
-            except Exception:
-                return 0.0
-
-        def match_rating_match(s1: str, s2: str) -> float:
-            if not s1 or not s2:
-                return 0.0
-            try:
-                return 1.0 if jellyfish.match_rating_codex(s1) == jellyfish.match_rating_codex(s2) else 0.0
-            except Exception:
-                return 0.0
-
         return {
-            "ph_soundex_name": soundex_match(first1, first2),
-            "ph_metaphone_name": metaphone_match(first1, first2),
-            "ph_nysiis_name": nysiis_match(first1, first2),
-            "ph_match_rating_name": match_rating_match(first1, first2),
-            "ph_soundex_full_name": soundex_match(n1, n2),
+            "ph_soundex_name": _phonetic_equal(jellyfish.soundex, first1, first2, "ph_soundex_name"),
+            "ph_metaphone_name": _phonetic_equal(jellyfish.metaphone, first1, first2, "ph_metaphone_name"),
+            "ph_nysiis_name": _phonetic_equal(jellyfish.nysiis, first1, first2, "ph_nysiis_name"),
+            "ph_match_rating_name": _phonetic_equal(
+                jellyfish.match_rating_codex, first1, first2, "ph_match_rating_name"
+            ),
+            "ph_soundex_full_name": _phonetic_equal(jellyfish.soundex, n1, n2, "ph_soundex_full_name"),
         }
+
+
+def _is_rust_panic(exc: BaseException) -> bool:
+    """
+    True only for pyo3's PanicException, raised when a Rust extension such as
+    jellyfish panics. pyo3 creates this class at runtime in a module that cannot be
+    imported, so it is identified by module + name rather than by isinstance.
+    """
+    cls = type(exc)
+    return cls.__module__ == "pyo3_runtime" and cls.__name__ == "PanicException"
+
+
+def _phonetic_equal(encoder, s1: str, s2: str, feature_name: str) -> float:
+    """
+    1.0 if `encoder` maps both strings to the same phonetic code, else 0.0.
+
+    Error handling, narrowest first:
+
+    * ``Exception`` — e.g. jellyfish's ValueError on non-letter input. Returns 0.0,
+      exactly as before this helper existed.
+
+    * pyo3 ``PanicException`` — jellyfish 1.0.3's match_rating_codex panics (Rust
+      ``Option::unwrap`` on None) on some accented Latin-1 letters, e.g. 'richárd'
+      (U+00E1) and 'wríght' (U+00ED); 'josé' and 'müller' are fine. PanicException
+      derives from BaseException, NOT Exception, so it used to escape every handler
+      in this module and crash the whole 50-feature computation.
+
+      Fallback: exact equality of the (already normalised) strings. This invents no
+      similarity: a deterministic encoder always maps identical input to identical
+      codes, so 1.0 for identical strings is exactly what the encoder would return;
+      0.0 otherwise is the conservative answer when the encoder cannot tell us more.
+      The input is NOT accent-stripped — Unicode is preserved as given.
+
+    * Any other BaseException (KeyboardInterrupt, SystemExit, ...) is re-raised
+      untouched. This is deliberately not a general BaseException handler.
+    """
+    if not s1 or not s2:
+        return 0.0
+    try:
+        return 1.0 if encoder(s1) == encoder(s2) else 0.0
+    except Exception:
+        return 0.0
+    except BaseException as exc:
+        if not _is_rust_panic(exc):
+            raise
+        PHONETIC_ENCODER_FALLBACKS.labels(feature=feature_name).inc()
+        # Codepoints only — names are PII and must not reach the logs.
+        non_ascii = sorted({f"U+{ord(ch):04X}" for ch in s1 + s2 if ord(ch) > 127})
+        logger.warning(
+            "Phonetic encoder %s panicked (non-ASCII codepoints %s); "
+            "using exact-equality fallback for %s",
+            getattr(encoder, "__name__", "encoder"), non_ascii or "none", feature_name,
+        )
+        return 1.0 if s1 == s2 else 0.0
 
 
 class TokenBasedFeatures:

@@ -74,6 +74,18 @@ DRIFT_ALERTS = Counter(
     ["drift_type", "feature_name"],
 )
 
+# ─── Feature Computation ──────────────────────────────────────────────────────
+
+# Not in LLD §7.1. Added so the phonetic-encoder fallback in feature_computation.py
+# is observable rather than silent: a sustained non-zero rate means real input is
+# hitting a third-party encoder defect and one phonetic feature is degraded to an
+# exact-equality check for those pairs.
+PHONETIC_ENCODER_FALLBACKS = Counter(
+    "feature_phonetic_encoder_fallback_total",
+    "Phonetic encoder panicked on an input; exact-equality fallback used",
+    ["feature"],
+)
+
 # ─── Service Health ───────────────────────────────────────────────────────────
 
 ACTIVE_MATERIALIZATION_JOBS = Gauge(

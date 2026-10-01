@@ -31,7 +31,7 @@ from src.repositories.online_store import OnlineFeatureStore
 from src.repositories.offline_store import FEATURE_COLUMN_NAMES, OfflineFeatureStore
 from src.services.feature_computation import FeatureComputationService
 from src.services.feature_store import FeatureStoreService
-from src.workers.materialization import MaterializationWorker, DriftDetectionWorker
+from src.workers.materialization import DriftDetectionWorker, run_materialization_job
 
 logger = logging.getLogger(__name__)
 
@@ -352,25 +352,19 @@ async def trigger_materialization(
     tenant: TenantContext = Depends(require_permission(Resource.FEATURES, Action.WRITE)),
     service: FeatureStoreService = Depends(get_feature_store_service),
     online_store: OnlineFeatureStore = Depends(get_online_store),
-    db: AsyncSession = Depends(get_db_session),
 ):
     job = await service.trigger_materialization(
         tenant_id=tenant.tenant_id,
         triggered_by=f"api:{tenant.user_id}",
     )
 
-    # Run materialization in background
-    computation_service = get_computation_service()
-    offline_store = get_offline_store()
-    registry = FeatureRegistryRepository(db)
-
-    worker = MaterializationWorker(
-        online_store=online_store,
-        offline_store=offline_store,
-        computation_service=computation_service,
-        registry=registry,
+    # Run in the background through the shared runner, which owns its own DB session
+    # (this request's session is closed before background tasks run) and chooses the
+    # data source from configuration. A missing or invalid source is reported as a
+    # FAILED job with error_message — see GET /api/v1/materialize/{job_id}.
+    background_tasks.add_task(
+        run_materialization_job, job, online_store, get_computation_service()
     )
-    background_tasks.add_task(worker.run_job, job)
 
     return MaterializationResponse(
         job_id=job.job_id,
@@ -409,6 +403,8 @@ async def get_materialization_status(
         started_at=job.started_at,
         completed_at=job.completed_at,
         triggered_by=job.triggered_by,
+        skipped_entities=job.skipped_entities,
+        error_message=job.error_message,
     )
 
 
@@ -436,6 +432,8 @@ async def list_materialization_jobs(
             started_at=j.started_at,
             completed_at=j.completed_at,
             triggered_by=j.triggered_by,
+            skipped_entities=j.skipped_entities,
+            error_message=j.error_message,
         )
         for j in jobs
     ]

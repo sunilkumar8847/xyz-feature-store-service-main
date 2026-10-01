@@ -135,6 +135,19 @@ class Settings(BaseSettings):
     MATERIALIZATION_LOOKBACK_DAYS: int = 30
     CACHE_HIT_WARN_THRESHOLD: float = 0.9  # Alert if < 90% cache hit
 
+    # ─── Materialization data source ─────────────────────────────────
+    # Where MaterializationWorker obtains the entity pairs it computes features for.
+    #   None        — no source configured. Jobs fail with an explicit error instead
+    #                 of reporting COMPLETED with zero pairs; the scheduler skips.
+    #   "synthetic" — the repository-root synthetic dataset in SYNTHETIC_DATA_DIR.
+    #                 DEVELOPMENT / TEST ONLY.
+    # The production MDM entity source is not implemented: no MDM API contract exists
+    # yet. It will be added as another MaterializationSource without worker changes.
+    MATERIALIZATION_SOURCE: Optional[str] = None
+    MATERIALIZATION_BATCH_SIZE: int = 1000
+    # Output of `python -m synthetic_data` (entities.parquet, pairs.parquet, manifest.json).
+    SYNTHETIC_DATA_DIR: Optional[str] = None
+
     # ─── Embedding Model ─────────────────────────────────────────────
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
     EMBEDDING_BATCH_SIZE: int = 32
@@ -163,5 +176,39 @@ class Settings(BaseSettings):
         return v
 
 
+MATERIALIZATION_SOURCES = frozenset({"synthetic"})
+SYNTHETIC_DATA_ENVIRONMENTS = frozenset({Environment.DEVELOPMENT, Environment.TEST})
+
+
+def check_materialization_source(s: "Settings") -> None:
+    """
+    Validate the materialization data-source configuration. Called when a source is
+    built (settings can be mutated at runtime, so this is not a load-time-only check).
+    Mirrors the training service's synthetic-data gate: synthetic data must never be
+    materialized into a staging or production feature store.
+    """
+    source = s.MATERIALIZATION_SOURCE
+    if source is None:
+        return
+    if source not in MATERIALIZATION_SOURCES:
+        raise ValueError(
+            f"MATERIALIZATION_SOURCE={source!r} is not supported. Supported: "
+            f"{sorted(MATERIALIZATION_SOURCES)}. (The production MDM entity source is "
+            f"not implemented yet.)"
+        )
+    if source == "synthetic":
+        if s.ENVIRONMENT not in SYNTHETIC_DATA_ENVIRONMENTS:
+            raise ValueError(
+                f"MATERIALIZATION_SOURCE=synthetic is not permitted with "
+                f"ENVIRONMENT={s.ENVIRONMENT.value}; synthetic data is development/test only."
+            )
+        if not s.SYNTHETIC_DATA_DIR:
+            raise ValueError(
+                "MATERIALIZATION_SOURCE=synthetic requires SYNTHETIC_DATA_DIR "
+                "(the output directory of `python -m synthetic_data`)."
+            )
+
+
 # Singleton instance
 settings = Settings()
+check_materialization_source(settings)

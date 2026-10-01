@@ -171,6 +171,15 @@ class MaterializationJob:
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     triggered_by: str = "scheduler"  # scheduler | api | drift
+    # Why the job FAILED (or completed with problems). Persisted to the existing
+    # materialization_jobs.error_message column.
+    error_message: Optional[str] = None
+
+    @property
+    def skipped_entities(self) -> int:
+        """Pairs the data source could not resolve (e.g. unknown entity id).
+        total_entities = processed + failed + skipped, so this needs no extra column."""
+        return max(self.total_entities - self.processed_entities - self.failed_entities, 0)
 
     @property
     def duration_seconds(self) -> Optional[float]:

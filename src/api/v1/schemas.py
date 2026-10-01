@@ -152,6 +152,10 @@ class MaterializationStatusResponse(BaseModel):
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
     triggered_by: str
+    # Additive (defaults keep older clients working): why a job failed, and how many
+    # pairs the data source could not resolve.
+    skipped_entities: int = 0
+    error_message: Optional[str] = None
 
 
 # ─── Offline Features ─────────────────────────────────────────────────────────

@@ -217,31 +217,29 @@ async def _run_scheduler():
 
 
 async def _trigger_scheduled_materialization():
-    """Called by scheduler — triggers materialization for all tenants."""
+    """Called by scheduler — materializes every tenant the configured source knows."""
     import src.core.dependencies as deps
-    from src.repositories.feature_registry import get_session_factory
-    from src.repositories.offline_store import OfflineFeatureStore
-    from src.workers.materialization import MaterializationWorker
+    from src.core.config import settings
     from src.domain.models import MaterializationJob
+    from src.workers.materialization import run_materialization_job
 
     logger.info("Scheduled materialization triggered")
 
     if not deps.online_store_instance:
         logger.warning("Online store not available — skipping scheduled materialization")
         return
-
-    async with get_session_factory()() as session:
-        from src.repositories.feature_registry import FeatureRegistryRepository
-        registry = FeatureRegistryRepository(session)
-        offline = OfflineFeatureStore()
-        worker = MaterializationWorker(
-            online_store=deps.online_store_instance,
-            offline_store=offline,
-            computation_service=deps.computation_service_instance,
-            registry=registry,
+    if settings.MATERIALIZATION_SOURCE is None:
+        # No source exists in production yet (the MDM entity source is not
+        # implemented). Skip rather than record a failed job every night.
+        logger.warning(
+            "No MATERIALIZATION_SOURCE configured — skipping scheduled materialization"
         )
-        job = MaterializationJob(triggered_by="scheduler")
-        await worker.run_job(job)
+        return
+
+    job = MaterializationJob(triggered_by="scheduler")
+    await run_materialization_job(
+        job, deps.online_store_instance, deps.computation_service_instance
+    )
 
 
 async def _trigger_drift_check():

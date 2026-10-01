@@ -218,6 +218,7 @@ class FeatureRegistryRepository:
             existing.failed_entities = job.failed_entities
             existing.started_at = job.started_at
             existing.completed_at = job.completed_at
+            existing.error_message = job.error_message
         else:
             orm = MaterializationJobORM(
                 id=job.job_id,
@@ -225,9 +226,16 @@ class FeatureRegistryRepository:
                 lookback_days=job.lookback_days,
                 status=job.status.value,
                 triggered_by=job.triggered_by,
+                error_message=job.error_message,
             )
             self._session.add(orm)
         return job
+
+    async def commit(self) -> None:
+        """Make pending changes durable. Needed by long-running background work that
+        owns its session (the materialization runner), where no request-scoped
+        dependency commits on its behalf."""
+        await self._session.commit()
 
     async def get_materialization_job(self, job_id: UUID) -> Optional[MaterializationJob]:
         orm = await self._session.get(MaterializationJobORM, job_id)
@@ -300,6 +308,7 @@ class FeatureRegistryRepository:
             started_at=orm.started_at,
             completed_at=orm.completed_at,
             triggered_by=orm.triggered_by,
+            error_message=orm.error_message,
         )
 
     @staticmethod

@@ -14,6 +14,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Iterator, List, Optional
+from uuid import uuid4
 
 import boto3
 import pandas as pd
@@ -109,16 +110,34 @@ class OfflineFeatureStore:
         self,
         feature_vectors: List[FeatureVector],
         partition_dt: Optional[datetime] = None,
+        data_source: Optional[str] = None,
     ) -> str:
         """
-        Write a batch of feature vectors to S3 as Parquet.
-        Returns the S3 path written.
+        Write a batch of feature vectors to S3 as Parquet. Returns the S3 path written.
+
+        * All vectors must belong to ONE tenant — the object is filed under that
+          tenant's prefix, so a mixed batch would expose one tenant's rows in another's
+          partition. Mixed input raises instead of being written.
+        * The partition timestamp defaults to the EARLIEST computed_at in the batch, not
+          the write time. Point-in-time reads prune files by partition timestamp; a
+          partition later than some of its rows would hide those rows from an as_of
+          that falls between computed_at and the write.
+        * The object key carries a random suffix so two batches in the same second
+          never overwrite each other (S3 PUT replaces an existing key silently).
+        * `data_source` is recorded as object metadata for provenance.
         """
         if not feature_vectors:
             return ""
 
-        dt = partition_dt or datetime.utcnow()
-        s3_key = self._make_s3_key(feature_vectors[0].tenant_id, dt)
+        tenants = {fv.tenant_id for fv in feature_vectors}
+        if len(tenants) != 1:
+            raise ValueError(
+                f"write_features received vectors for {len(tenants)} tenants "
+                f"{sorted(tenants)}; a batch must be single-tenant."
+            )
+
+        dt = partition_dt or min(_to_naive_utc(fv.computed_at) for fv in feature_vectors)
+        s3_key = self._make_s3_key(feature_vectors[0].tenant_id, dt, unique=True)
 
         rows = [self._fv_to_row(fv) for fv in feature_vectors]
         df = pd.DataFrame(rows)
@@ -144,6 +163,7 @@ class OfflineFeatureStore:
                     "feature_version": feature_vectors[0].feature_version,
                     "row_count": str(len(feature_vectors)),
                     "tenant_id": feature_vectors[0].tenant_id,
+                    "data_source": data_source or "unspecified",
                 },
             )
             logger.info(f"Wrote {len(feature_vectors)} features to s3://{self._bucket}/{s3_key}")
@@ -265,11 +285,12 @@ class OfflineFeatureStore:
 
     # ─── Private Helpers ─────────────────────────────────────────────────────
 
-    def _make_s3_key(self, tenant_id: str, dt: datetime) -> str:
+    def _make_s3_key(self, tenant_id: str, dt: datetime, unique: bool = False) -> str:
+        suffix = f"_{uuid4().hex[:12]}" if unique else ""
         return (
             f"{self._prefix}/{tenant_id}/"
             f"year={dt.year}/month={dt.month:02d}/day={dt.day:02d}/"
-            f"features_{dt.strftime('%H%M%S')}.parquet"
+            f"features_{dt.strftime('%H%M%S')}{suffix}.parquet"
         )
 
     def _list_keys_before(
@@ -288,11 +309,12 @@ class OfflineFeatureStore:
     def _partition_dt_from_key(key: str) -> Optional[datetime]:
         """
         Parse the partition timestamp encoded in the object key:
-            features/{tenant}/year=YYYY/month=MM/day=DD/features_HHMMSS.parquet
-        Returns None if the key does not follow that layout.
+            features/{tenant}/year=YYYY/month=MM/day=DD/features_HHMMSS[_<hex>].parquet
+        The optional hex suffix makes keys unique per write. Returns None if the key
+        does not follow that layout.
         """
         match = re.search(
-            r"year=(\d{4})/month=(\d{2})/day=(\d{2})/features_(\d{2})(\d{2})(\d{2})\.parquet$",
+            r"year=(\d{4})/month=(\d{2})/day=(\d{2})/features_(\d{2})(\d{2})(\d{2})(?:_[0-9a-f]+)?\.parquet$",
             key,
         )
         if not match:
@@ -372,7 +394,15 @@ class OfflineFeatureStore:
             "computed_at": fv.computed_at,
             "computation_ms": fv.computation_ms,
         }
-        # Add feature columns
-        for name in _get_feature_column_names():
-            row[f"feat_{name}"] = float(fv.features.get(name, 0.0))
+        # Every canonical feature must be present. A missing name (for example a vector
+        # carrying the group-level `ph_err_*` fallback names) is an error, never a
+        # silently zero-filled column — zeros would be indistinguishable from real values.
+        missing = [n for n in FEATURE_COLUMN_NAMES if n not in fv.features]
+        if missing:
+            raise ValueError(
+                f"FeatureVector {fv.entity_id_1}:{fv.entity_id_2} is missing "
+                f"{len(missing)} canonical feature(s), e.g. {missing[:3]}"
+            )
+        for name in FEATURE_COLUMN_NAMES:
+            row[f"feat_{name}"] = float(fv.features[name])
         return row
