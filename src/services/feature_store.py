@@ -20,7 +20,7 @@ from src.domain.models import (
     MaterializationStatus, OfflineFeatureRequest,
 )
 from src.repositories.feature_registry import FeatureRegistryRepository
-from src.repositories.online_store import OnlineFeatureStore
+from src.repositories.online_store import OnlineFeatureStore, OnlineStoreError
 from src.repositories.offline_store import OfflineFeatureStore
 from src.services.feature_computation import FeatureComputationService
 from src.core.metrics import (
@@ -29,6 +29,17 @@ from src.core.metrics import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class FeatureNotFoundError(LookupError):
+    """No servable feature vector is stored for this pair and tenant."""
+
+    def __init__(self, entity_id_1: str, entity_id_2: str):
+        self.entity_id_1, self.entity_id_2 = entity_id_1, entity_id_2
+        super().__init__(
+            f"No materialized features for pair ({entity_id_1}, {entity_id_2}). "
+            f"Features are produced by materialization, not computed on request."
+        )
 
 
 class FeatureStoreService:
@@ -45,60 +56,46 @@ class FeatureStoreService:
         computation_service: FeatureComputationService,
         db_session: AsyncSession,
     ):
-        self._online = online_store
+        self._online_store = online_store
         self._offline = offline_store
         self._compute = computation_service
         self._registry = FeatureRegistryRepository(db_session)
+
+    @property
+    def _online(self) -> OnlineFeatureStore:
+        if self._online_store is None:
+            # Redis was unreachable at startup. Handlers used to dereference None and
+            # fail with an AttributeError (HTTP 500).
+            raise OnlineStoreError("Online store (Redis) is unavailable")
+        return self._online_store
 
     async def get_features(
         self,
         entity_id_1: str,
         entity_id_2: str,
         tenant_id: str,
-        entity1: Optional[EntitySnapshot] = None,
-        entity2: Optional[EntitySnapshot] = None,
     ) -> FeatureVector:
         """
-        Get features for an entity pair.
-        Strategy:
-          1. Try online store (Redis) → <10ms
-          2. If miss: compute on-the-fly → ~50-100ms
-          3. Store computed features in online store (async)
+        The MATERIALIZED feature vector of a pair, from the online store.
+
+        Raises FeatureNotFoundError when the store holds no servable vector. There is
+        deliberately no compute-on-miss here any more: that path computed from the
+        three fields a caller put in the URL (name/email/phone — personal data in
+        access logs, and no address or geo fields), cached the partial result for 24
+        hours and wrote it to the offline store, so the same pair could have different
+        features in training and in serving. Features are produced by materialization.
         """
         start = time.perf_counter()
-
-        # 1. Try online store
         cached = await self._online.get(entity_id_1, entity_id_2, tenant_id)
         elapsed_ms = (time.perf_counter() - start) * 1000
 
-        if cached is not None:
-            FEATURE_GET_COUNTER.labels(status="hit", store="online").inc()
-            FEATURE_GET_LATENCY.labels(store_type="cache").observe(elapsed_ms)
-            return cached
+        if cached is None:
+            FEATURE_GET_COUNTER.labels(status="miss", store="online").inc()
+            raise FeatureNotFoundError(entity_id_1, entity_id_2)
 
-        # 2. Cache miss — compute on-the-fly
-        FEATURE_GET_COUNTER.labels(status="miss", store="online").inc()
-
-        if entity1 is None or entity2 is None:
-            raise ValueError(
-                f"Cache miss for ({entity_id_1}, {entity_id_2}) and no entity snapshots provided. "
-                f"Pass entity snapshots to compute features on-the-fly."
-            )
-
-        fv = self._compute.compute(entity1, entity2, settings.FEATURE_VERSION)
-
-        # 3. Store in online cache (best-effort, non-blocking)
-        await self._online.set(fv)
-
-        # 4. Persist to offline store (best-effort)
-        try:
-            self._offline.write_features([fv])
-        except Exception as e:
-            logger.warning(f"Offline store write failed (non-critical): {e}")
-
-        total_ms = (time.perf_counter() - start) * 1000
-        FEATURE_GET_LATENCY.labels(store_type="compute").observe(total_ms)
-        return fv
+        FEATURE_GET_COUNTER.labels(status="hit", store="online").inc()
+        FEATURE_GET_LATENCY.labels(store_type="cache").observe(elapsed_ms)
+        return cached
 
     async def get_features_batch(
         self,
@@ -108,42 +105,28 @@ class FeatureStoreService:
         """
         Batch feature retrieval for up to 100 entity pairs.
         Uses Redis pipeline for minimum round-trips.
+
+        Pairs missing from the online store are computed only when the caller supplied
+        both records in the request BODY. Such vectors are returned but NOT stored:
+        the stores hold materialized vectors only, so a caller-supplied (possibly
+        partial) record can never become the features another request is served.
         """
         if len(pairs) > settings.FEATURE_BATCH_SIZE:
             raise ValueError(f"Batch size {len(pairs)} exceeds maximum {settings.FEATURE_BATCH_SIZE}")
 
-        # Batch get from online store
         raw_pairs = [(p["entity_id_1"], p["entity_id_2"], p["tenant_id"]) for p in pairs]
         cached_results = await self._online.get_batch(raw_pairs)
 
-        results = []
-        compute_needed = []
-
+        results: List[Optional[FeatureVector]] = []
         for pair in pairs:
             e1, e2, tid = pair["entity_id_1"], pair["entity_id_2"], pair["tenant_id"]
-            pair_key = f"{e1}:{e2}:{tid}"
-            cached = cached_results.get(pair_key)
-            if cached is not None:
-                results.append(cached)
-            else:
-                results.append(None)
-                compute_needed.append((len(results) - 1, pair))
-
-        # Compute missing features
-        if compute_needed and entity_snapshots:
-            compute_results = []
-            for idx, pair in compute_needed:
-                e1_snap = entity_snapshots.get(pair["entity_id_1"])
-                e2_snap = entity_snapshots.get(pair["entity_id_2"])
+            fv = cached_results.get(f"{e1}:{e2}:{tid}")
+            if fv is None and entity_snapshots:
+                e1_snap = entity_snapshots.get(e1)
+                e2_snap = entity_snapshots.get(e2)
                 if e1_snap and e2_snap:
                     fv = self._compute.compute(e1_snap, e2_snap, settings.FEATURE_VERSION)
-                    results[idx] = fv
-                    compute_results.append(fv)
-
-            # Cache computed features
-            if compute_results:
-                await self._online.set_batch(compute_results)
-
+            results.append(fv)
         return results
 
     async def push_features(
@@ -189,11 +172,20 @@ class FeatureStoreService:
         logger.info(f"Materialization job {job.job_id} created by {triggered_by}")
         return job
 
-    async def get_job_status(self, job_id: UUID) -> Optional[MaterializationJob]:
-        return await self._registry.get_materialization_job(job_id)
+    async def get_job_status(
+        self, job_id: UUID, tenant_id: Optional[str] = None, all_tenants: bool = False,
+    ) -> Optional[MaterializationJob]:
+        return await self._registry.get_materialization_job(
+            job_id, tenant_id=tenant_id, all_tenants=all_tenants)
 
-    async def list_recent_jobs(self, limit: int = 10) -> List[MaterializationJob]:
-        return await self._registry.list_recent_jobs(limit)
+    async def list_recent_jobs(
+        self, limit: int = 10, tenant_id: Optional[str] = None, all_tenants: bool = False,
+    ) -> List[MaterializationJob]:
+        return await self._registry.list_recent_jobs(
+            limit, tenant_id=tenant_id, all_tenants=all_tenants)
+
+    async def find_active_job(self, tenant_id: Optional[str]) -> Optional[MaterializationJob]:
+        return await self._registry.find_active_job(tenant_id)
 
     async def list_feature_definitions(
         self,
@@ -201,5 +193,5 @@ class FeatureStoreService:
     ):
         return await self._registry.list_features(version=version or settings.FEATURE_VERSION)
 
-    async def get_online_store_stats(self) -> Dict:
-        return await self._online.get_stats()
+    async def get_online_store_stats(self, tenant_id: str) -> Dict:
+        return await self._online.get_stats(tenant_id)

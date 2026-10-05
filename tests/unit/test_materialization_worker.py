@@ -55,11 +55,28 @@ class FakeOffline:
         self.fail = fail
         self.writes: List[dict] = []
 
-    def write_features(self, vectors, partition_dt=None, data_source=None):
+    def write_features(self, vectors, partition_dt=None, data_source=None, source_id=None):
         if self.fail:
             raise ConnectionError("S3 endpoint unreachable")
-        self.writes.append({"vectors": list(vectors), "data_source": data_source})
+        self.writes.append({"vectors": list(vectors), "data_source": data_source,
+                            "source_id": source_id})
         return "s3://bucket/key.parquet"
+
+    def existing_vectors(self, tenant_id, feature_version, source_id):
+        """What a real offline store answers: the latest stored vector per pair that
+        was written for this tenant, version and source_id."""
+        self.scans = getattr(self, "scans", 0) + 1
+        if getattr(self, "fail_scan", False):
+            raise ConnectionError("S3 endpoint unreachable")
+        out = {}
+        for w in self.writes:
+            if w["source_id"] != source_id:
+                continue
+            for fv in w["vectors"]:
+                if fv.tenant_id == tenant_id and fv.feature_version == feature_version:
+                    a, b = sorted((fv.entity_id_1, fv.entity_id_2))
+                    out[f"{a}:{b}"] = fv
+        return out
 
 
 class FakeOnline:
@@ -67,8 +84,9 @@ class FakeOnline:
         self.short_by = short_by
         self.writes: List[List[FeatureVector]] = []
 
-    async def set_batch(self, vectors):
+    async def set_batch(self, vectors, ttl_hours=None):
         self.writes.append(list(vectors))
+        self.ttl_hours = ttl_hours
         return len(vectors) - self.short_by
 
 
@@ -212,10 +230,10 @@ class TestStoreFailures:
 
     async def test_offline_failure_mid_job_stops_and_reports_progress(self):
         class FailSecond(FakeOffline):
-            def write_features(self, vectors, partition_dt=None, data_source=None):
+            def write_features(self, vectors, partition_dt=None, data_source=None, source_id=None):
                 if self.writes:
                     raise ConnectionError("lost connection")
-                return super().write_features(vectors, partition_dt, data_source)
+                return super().write_features(vectors, partition_dt, data_source, source_id)
 
         src = FakeSource([batch(T1, ("A1", "A2")), batch(T1, ("A3", "A4")), batch(T1, ("A5", "A6"))])
         result = await worker(src, offline=FailSecond()).run_job(job())

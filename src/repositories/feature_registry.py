@@ -237,15 +237,69 @@ class FeatureRegistryRepository:
         dependency commits on its behalf."""
         await self._session.commit()
 
-    async def get_materialization_job(self, job_id: UUID) -> Optional[MaterializationJob]:
+    async def get_materialization_job(
+        self,
+        job_id: UUID,
+        tenant_id: Optional[str] = None,
+        all_tenants: bool = False,
+    ) -> Optional[MaterializationJob]:
+        """
+        A job, IF the caller may see it: a tenant sees only jobs created for that
+        tenant. `all_tenants=True` (platform callers, internal code) lifts the filter.
+        A job of another tenant is reported exactly like a job that does not exist.
+        """
         orm = await self._session.get(MaterializationJobORM, job_id)
+        if orm is None:
+            return None
+        if not all_tenants and (tenant_id is None or orm.tenant_id != tenant_id):
+            return None
+        return self._mat_orm_to_domain(orm)
+
+    async def list_recent_jobs(
+        self,
+        limit: int = 10,
+        tenant_id: Optional[str] = None,
+        all_tenants: bool = False,
+    ) -> List[MaterializationJob]:
+        """Recent jobs of ONE tenant (or of everyone with all_tenants=True)."""
+        stmt = select(MaterializationJobORM)
+        if not all_tenants:
+            if tenant_id is None:
+                return []
+            stmt = stmt.where(MaterializationJobORM.tenant_id == tenant_id)
+        result = await self._session.execute(
+            stmt.order_by(MaterializationJobORM.created_at.desc()).limit(limit)
+        )
+        return [self._mat_orm_to_domain(r) for r in result.scalars().all()]
+
+    async def find_active_job(self, tenant_id: Optional[str]) -> Optional[MaterializationJob]:
+        """A PENDING/RUNNING job that would conflict with a new job for `tenant_id`
+        (same tenant, or an all-tenant job; any job when tenant_id is None)."""
+        stmt = select(MaterializationJobORM).where(
+            MaterializationJobORM.status.in_(["PENDING", "RUNNING"])
+        )
+        if tenant_id is not None:
+            stmt = stmt.where(
+                (MaterializationJobORM.tenant_id == tenant_id)
+                | (MaterializationJobORM.tenant_id.is_(None))
+            )
+        result = await self._session.execute(
+            stmt.order_by(MaterializationJobORM.created_at.desc()).limit(1)
+        )
+        orm = result.scalars().first()
         return self._mat_orm_to_domain(orm) if orm else None
 
-    async def list_recent_jobs(self, limit: int = 10) -> List[MaterializationJob]:
+    async def list_unfinished_jobs(self, pending_grace_seconds: int = 120) -> List[MaterializationJob]:
+        """RUNNING jobs, and PENDING jobs older than the grace period."""
+        from datetime import timedelta
+
+        cutoff = datetime.utcnow() - timedelta(seconds=pending_grace_seconds)
         result = await self._session.execute(
-            select(MaterializationJobORM)
-            .order_by(MaterializationJobORM.created_at.desc())
-            .limit(limit)
+            select(MaterializationJobORM).where(
+                (MaterializationJobORM.status == "RUNNING")
+                | ((MaterializationJobORM.status == "PENDING")
+                   & (MaterializationJobORM.created_at < cutoff))
+            )
         )
         return [self._mat_orm_to_domain(r) for r in result.scalars().all()]
 

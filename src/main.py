@@ -116,6 +116,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     deps.computation_service_instance = FeatureComputationService()
     logger.info("Feature computation service: INITIALIZED")
 
+    # 2b. Load the embedding model now, so a missing model is visible at startup (and
+    #     in /health) instead of silently zeroing the semantic features later.
+    from src.services.feature_computation import embedding_model_ready
+    if await asyncio.to_thread(embedding_model_ready):
+        logger.info("Embedding model: LOADED")
+    else:
+        logger.error(
+            "Embedding model: NOT AVAILABLE — feature computation and materialization "
+            "will fail until it can be loaded"
+        )
+
     # 3. Create database tables (idempotent)
     try:
         async with get_engine().begin() as conn:
@@ -130,6 +141,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         logger.info("Feature definitions: SEEDED")
     except Exception as e:
         logger.warning(f"Feature definition seeding failed (non-critical): {e}")
+
+    # 4b. Close jobs a previous process left RUNNING (see recover_interrupted_jobs).
+    try:
+        from src.repositories.feature_registry import (
+            FeatureRegistryRepository, get_session_factory,
+        )
+        from src.workers.materialization import default_job_lock, recover_interrupted_jobs
+        async with get_session_factory()() as session:
+            closed = await recover_interrupted_jobs(
+                FeatureRegistryRepository(session), default_job_lock())
+        if closed:
+            logger.warning(f"Marked {len(closed)} interrupted materialization job(s) FAILED")
+    except Exception as e:
+        logger.error(f"Interrupted-job recovery failed: {e}")
 
     # 5. Start Kafka consumer (background task)
     kafka_task = None

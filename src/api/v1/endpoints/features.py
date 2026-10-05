@@ -27,10 +27,12 @@ from src.api.v1.schemas import (
 from src.core.config import settings
 from src.domain.models import EntitySnapshot, OfflineFeatureRequest as DomainOfflineRequest
 from src.repositories.feature_registry import FeatureRegistryRepository, get_db_session
-from src.repositories.online_store import OnlineFeatureStore
-from src.repositories.offline_store import FEATURE_COLUMN_NAMES, OfflineFeatureStore
-from src.services.feature_computation import FeatureComputationService
-from src.services.feature_store import FeatureStoreService
+from src.repositories.online_store import OnlineFeatureStore, OnlineStoreError
+from src.repositories.offline_store import FEATURE_COLUMN_NAMES, OfflineFeatureStore, OfflineStoreError
+from src.services.feature_computation import (
+    FeatureComputationError, FeatureComputationService, embedding_model_loaded,
+)
+from src.services.feature_store import FeatureNotFoundError, FeatureStoreService
 from src.workers.materialization import DriftDetectionWorker, run_materialization_job
 
 logger = logging.getLogger(__name__)
@@ -41,9 +43,21 @@ public_router = APIRouter(prefix="/v1", tags=["features"])
 
 # ─── Dependency Injection ─────────────────────────────────────────────────────
 
-async def get_online_store() -> OnlineFeatureStore:
-    from src.core.dependencies import online_store_instance
-    return online_store_instance
+async def get_online_store() -> Optional[OnlineFeatureStore]:
+    """The online store, or None when Redis was unreachable at startup. Endpoints that
+    need it answer 503 (FeatureStoreService raises OnlineStoreError); endpoints that
+    only read the offline store keep working."""
+    import src.core.dependencies as deps
+
+    return deps.online_store_instance
+
+
+_PLATFORM_ROLES = {"PLATFORM_ADMIN"}
+
+
+def _is_platform(tenant: TenantContext) -> bool:
+    """Platform-level callers (operators), as opposed to a tenant's own users."""
+    return bool(tenant.is_platform) or bool(_PLATFORM_ROLES & {r.upper() for r in tenant.roles})
 
 
 def get_offline_store() -> OfflineFeatureStore:
@@ -72,14 +86,17 @@ async def get_feature_store_service(
 # ─── Feature Retrieval Endpoints ─────────────────────────────────────────────
 
 
+_RECORD_FIELD_PARAMS = ("name1", "name2", "email1", "email2", "phone1", "phone2")
+
+
 @router.get(
     "/features/{entity_id_1}/{entity_id_2}",
     response_model=FeatureGetResponse,
     summary="Get features for entity pair",
     description=(
-        "Retrieve the 50-dimensional feature vector for an entity pair. "
-        "Returns from Redis cache (<10ms) or computes on-the-fly (~100ms). "
-        "Pass entity field data to enable on-the-fly computation on cache miss."
+        "Retrieve the materialized 50-dimensional feature vector for an entity pair from "
+        "the online store. 404 when no vector is stored for this tenant. Features are "
+        "never computed from URL parameters."
     ),
 )
 async def get_features(
@@ -87,44 +104,37 @@ async def get_features(
     entity_id_2: str,
     tenant: TenantContext = Depends(require_permission(Resource.FEATURES, Action.READ)),
     entity_type: Optional[str] = Query(default="customer", description="Entity type"),
-    name1: Optional[str] = Query(None, description="Entity 1 name (for on-the-fly compute)"),
-    name2: Optional[str] = Query(None, description="Entity 2 name (for on-the-fly compute)"),
-    email1: Optional[str] = Query(None, description="Entity 1 email"),
-    email2: Optional[str] = Query(None, description="Entity 2 email"),
-    phone1: Optional[str] = Query(None, description="Entity 1 phone"),
-    phone2: Optional[str] = Query(None, description="Entity 2 phone"),
+    name1: Optional[str] = Query(None, include_in_schema=False),
+    name2: Optional[str] = Query(None, include_in_schema=False),
+    email1: Optional[str] = Query(None, include_in_schema=False),
+    email2: Optional[str] = Query(None, include_in_schema=False),
+    phone1: Optional[str] = Query(None, include_in_schema=False),
+    phone2: Optional[str] = Query(None, include_in_schema=False),
     service: FeatureStoreService = Depends(get_feature_store_service),
 ):
-    tenant_id = tenant.tenant_id
-    # Build entity snapshots if field data provided
-    entity1 = None
-    entity2 = None
-
-    if name1 or email1 or phone1:
-        entity1 = EntitySnapshot(
-            entity_id=entity_id_1,
-            tenant_id=tenant_id,
-            entity_type=entity_type,
-            fields={"name": name1, "email": email1, "phone": phone1},
+    # Record fields in the query string used to trigger on-the-fly computation. That
+    # put personal data into URLs (and so into access logs) and built a vector from
+    # three fields only — different from the materialized vector of the same pair.
+    # The parameters are still parsed so that sending them is an explicit error rather
+    # than being silently ignored.
+    if any(v is not None for v in (name1, name2, email1, email2, phone1, phone2)):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Record fields in the query string are not accepted (personal data in "
+                "URLs; partial features). Features are served from materialization only."
+            ),
         )
-    if name2 or email2 or phone2:
-        entity2 = EntitySnapshot(
-            entity_id=entity_id_2,
-            tenant_id=tenant_id,
-            entity_type=entity_type,
-            fields={"name": name2, "email": email2, "phone": phone2},
-        )
-
     try:
         fv = await service.get_features(
             entity_id_1=entity_id_1,
             entity_id_2=entity_id_2,
-            tenant_id=tenant_id,
-            entity1=entity1,
-            entity2=entity2,
+            tenant_id=tenant.tenant_id,
         )
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    except FeatureNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except OnlineStoreError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
 
     return FeatureGetResponse(
         entity_id_1=fv.entity_id_1,
@@ -135,7 +145,7 @@ async def get_features(
         timestamp=fv.computed_at.isoformat(),
         version=fv.feature_version,
         computation_ms=fv.computation_ms,
-        source="cache" if fv.computation_ms < 1.0 else "compute",
+        source="cache",
     )
 
 
@@ -183,10 +193,19 @@ async def get_features_batch(
                     fields=p.entity2_fields,
                 )
 
-    results = await service.get_features_batch(
-        pairs=pairs,
-        entity_snapshots=entity_snapshots if entity_snapshots else None,
-    )
+    try:
+        results = await service.get_features_batch(
+            pairs=pairs,
+            entity_snapshots=entity_snapshots if entity_snapshots else None,
+        )
+    except OnlineStoreError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    except FeatureComputationError as e:
+        # No substituted values: a vector that cannot be computed is an error.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Feature computation failed: {e}",
+        )
 
     response_results = []
     found = 0
@@ -241,7 +260,10 @@ async def push_features(
         entity_type=request.entity_type,
         fields=request.fields,
     )
-    invalidated = await service.push_features(entity_id, tenant.tenant_id, entity)
+    try:
+        invalidated = await service.push_features(entity_id, tenant.tenant_id, entity)
+    except OnlineStoreError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
     return FeaturePushResponse(
         entity_id=entity_id,
         invalidated_pairs=invalidated,
@@ -306,7 +328,11 @@ async def get_offline_features(
         feature_version=request.feature_version,
     )
 
-    df = await service.get_offline_features(domain_request)
+    try:
+        df = await service.get_offline_features(domain_request)
+    except OfflineStoreError as e:
+        # Never answered as "0 pairs found": the store could not be read.
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
 
     # The service already returns point-in-time correct rows; serialise them so
     # training can actually consume features (previously only counts were returned,
@@ -353,6 +379,16 @@ async def trigger_materialization(
     service: FeatureStoreService = Depends(get_feature_store_service),
     online_store: OnlineFeatureStore = Depends(get_online_store),
 ):
+    active = await service.find_active_job(tenant.tenant_id)
+    if active is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "A materialization job is already "
+                f"{active.status.value.lower()} for this tenant"
+                + (f" (job {active.job_id})." if active.tenant_id == tenant.tenant_id else ".")
+            ),
+        )
     job = await service.trigger_materialization(
         tenant_id=tenant.tenant_id,
         triggered_by=f"api:{tenant.user_id}",
@@ -385,7 +421,9 @@ async def get_materialization_status(
     tenant: TenantContext = Depends(require_permission(Resource.FEATURES, Action.READ)),
     service: FeatureStoreService = Depends(get_feature_store_service),
 ):
-    job = await service.get_job_status(job_id)
+    # Tenant-scoped: another tenant's job is indistinguishable from a missing one.
+    job = await service.get_job_status(
+        job_id, tenant_id=tenant.tenant_id, all_tenants=_is_platform(tenant))
     if not job:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -418,7 +456,8 @@ async def list_materialization_jobs(
     tenant: TenantContext = Depends(require_permission(Resource.FEATURES, Action.READ)),
     service: FeatureStoreService = Depends(get_feature_store_service),
 ):
-    jobs = await service.list_recent_jobs(limit=limit)
+    jobs = await service.list_recent_jobs(
+        limit=limit, tenant_id=tenant.tenant_id, all_tenants=_is_platform(tenant))
     return [
         MaterializationStatusResponse(
             job_id=j.job_id,
@@ -452,6 +491,13 @@ async def get_drift_reports(
     tenant: TenantContext = Depends(require_permission(Resource.FEATURES, Action.READ)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    # Drift reports are computed across the platform and carry no tenant id, so they
+    # cannot be filtered per tenant: platform callers only.
+    if not _is_platform(tenant):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Drift reports are platform-level and not available to tenant callers",
+        )
     registry = FeatureRegistryRepository(db)
     reports = await registry.get_latest_drift_reports(
         feature_name=feature_name,
@@ -482,14 +528,16 @@ async def get_drift_reports(
     summary="Service health check",
 )
 async def health_check(
-    online_store: OnlineFeatureStore = Depends(get_online_store),
     db: AsyncSession = Depends(get_db_session),
 ):
+    import src.core.dependencies as deps
+
+    online_store = deps.online_store_instance
     checks = {}
 
     # Redis
     try:
-        checks["redis"] = await online_store.ping()
+        checks["redis"] = bool(online_store) and await online_store.ping()
     except Exception:
         checks["redis"] = False
 
@@ -502,12 +550,14 @@ async def health_check(
     except Exception:
         checks["postgres"] = False
 
-    # S3 (basic check — just that boto3 can be instantiated)
+    # S3: the offline bucket really answers (this used to be "boto3 can be imported").
     try:
-        import boto3
-        checks["s3"] = True
+        checks["s3"] = await asyncio.to_thread(OfflineFeatureStore().ping)
     except Exception:
         checks["s3"] = False
+
+    # Embedding model: without it no semantic feature can be computed.
+    checks["embedding_model"] = embedding_model_loaded()
 
     # Kafka (best-effort)
     checks["kafka"] = True  # Kafka consumer runs in background
@@ -533,7 +583,13 @@ async def get_stats(
     tenant: TenantContext = Depends(require_permission(Resource.FEATURES, Action.READ)),
     online_store: OnlineFeatureStore = Depends(get_online_store),
 ):
-    stats = await online_store.get_stats()
+    if online_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Online store (Redis) is unavailable",
+        )
+    # The caller's own tenant only (there used to be one counter for all tenants).
+    stats = await online_store.get_stats(tenant.tenant_id)
     return StoreStatsResponse(
         online_store=stats,
         service_version=settings.SERVICE_VERSION,

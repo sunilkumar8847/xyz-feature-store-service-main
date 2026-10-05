@@ -175,8 +175,8 @@ class TestTrainingServingParity:
         assert len(FEATURE_COLUMN_NAMES) == 50
         assert len(set(FEATURE_COLUMN_NAMES)) == 50
         # Recomputing must give a byte-identical ordering.
-        from src.repositories.offline_store import _get_feature_column_names
-        assert _get_feature_column_names() == FEATURE_COLUMN_NAMES
+        from src.domain.feature_catalog import FEATURE_NAMES
+        assert FEATURE_COLUMN_NAMES == sorted(FEATURE_NAMES) == list(FEATURE_NAMES)
 
     def test_no_placeholder_feature_names(self):
         """Guards against the `feature_0..feature_49` fabricated-vector pattern."""

@@ -23,6 +23,7 @@ import pyarrow.parquet as pq
 from botocore.exceptions import BotoCoreError, ClientError
 
 from src.core.config import settings
+from src.domain.feature_catalog import FEATURE_NAMES
 from src.domain.models import FeatureVector, OfflineFeatureRequest
 
 logger = logging.getLogger(__name__)
@@ -36,40 +37,15 @@ def _to_naive_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
-def _get_feature_column_names() -> List[str]:
-    """Return sorted list of all 50 feature names (without 'feat_' prefix)."""
-    return sorted([
-        # String Similarity (15)
-        "ss_levenshtein_name", "ss_jaro_winkler_name", "ss_damerau_levenshtein_name",
-        "ss_hamming_name", "ss_jaro_name", "ss_levenshtein_address",
-        "ss_jaro_winkler_address", "ss_damerau_address", "ss_levenshtein_email",
-        "ss_jaro_winkler_email", "ss_name_addr_cross", "ss_longest_common_subseq",
-        "ss_common_prefix_name", "ss_osa_distance_name", "ss_postfix_similarity",
-        # Phonetic (5)
-        "ph_soundex_name", "ph_metaphone_name", "ph_nysiis_name",
-        "ph_match_rating_name", "ph_soundex_full_name",
-        # Token-based (8)
-        "tk_jaccard_name", "tk_jaccard_address", "tk_token_sort_ratio_name",
-        "tk_token_set_ratio_name", "tk_partial_ratio_name", "tk_token_sort_address",
-        "tk_token_set_address", "tk_common_token_count",
-        # Semantic (10)
-        "sem_cosine_name", "sem_euclidean_name", "sem_cosine_address",
-        "sem_euclidean_address", "sem_cosine_full", "sem_euclidean_full",
-        "sem_cross_name_addr", "sem_angular_name", "sem_dot_product_name",
-        "sem_cosine_name_addr_concat",
-        # Structural (7)
-        "str_field_presence_ratio", "str_length_ratio_name", "str_null_count_diff",
-        "str_field_overlap", "str_schema_similarity", "str_asymmetric_null_ratio",
-        "str_word_count_ratio_name",
-        # Domain-specific (5)
-        "dom_email_domain_match", "dom_phone_prefix_match", "dom_phone_full_match",
-        "dom_geo_similarity", "dom_email_local_similarity",
-    ])
+class OfflineStoreError(RuntimeError):
+    """S3 could not be listed or read. Never reported as "no features found"."""
 
-# Canonical feature ordering — the single source of truth shared by the Parquet
-# schema below and the /features/offline response. Matches FeatureVector.as_list,
-# which orders by sorted(features.keys()), so offline and online vectors align.
-FEATURE_COLUMN_NAMES: List[str] = _get_feature_column_names()
+
+# Canonical feature ordering — defined once in src/domain/feature_catalog.py and shared
+# by the Parquet schema below and the /features/offline response. Matches
+# FeatureVector.as_list, which orders by sorted(features.keys()), so offline and online
+# vectors align.
+FEATURE_COLUMN_NAMES: List[str] = list(FEATURE_NAMES)
 
 
 # ─── Arrow Schema: Fixed schema for all feature parquet files ─────────────────
@@ -111,6 +87,7 @@ class OfflineFeatureStore:
         feature_vectors: List[FeatureVector],
         partition_dt: Optional[datetime] = None,
         data_source: Optional[str] = None,
+        source_id: Optional[str] = None,
     ) -> str:
         """
         Write a batch of feature vectors to S3 as Parquet. Returns the S3 path written.
@@ -124,7 +101,9 @@ class OfflineFeatureStore:
           that falls between computed_at and the write.
         * The object key carries a random suffix so two batches in the same second
           never overwrite each other (S3 PUT replaces an existing key silently).
-        * `data_source` is recorded as object metadata for provenance.
+        * `data_source` and `source_id` (the exact input it was computed from, e.g. a
+          dataset id) are recorded as object metadata for provenance; source_id is what
+          lets a repeated materialization recognise vectors it has already written.
         """
         if not feature_vectors:
             return ""
@@ -164,6 +143,7 @@ class OfflineFeatureStore:
                     "row_count": str(len(feature_vectors)),
                     "tenant_id": feature_vectors[0].tenant_id,
                     "data_source": data_source or "unspecified",
+                    "source_id": source_id or "unspecified",
                 },
             )
             logger.info(f"Wrote {len(feature_vectors)} features to s3://{self._bucket}/{s3_key}")
@@ -195,28 +175,21 @@ class OfflineFeatureStore:
             logger.warning(f"No features found for tenant {request.tenant_id} before {request.as_of_timestamp}")
             return pd.DataFrame()
 
-        # Build pair lookup set
-        pair_set = {
-            (e1, e2) for e1, e2 in request.entity_pairs
-        }
+        # Requested pairs, order-independent (pair_id = "min:max").
+        wanted = {":".join(sorted((e1, e2))) for e1, e2 in request.entity_pairs}
 
-        # Read and filter Parquet files
+        # Read and filter Parquet files. A file that cannot be read FAILS the request:
+        # skipping it used to return fewer rows with no sign that data was missing.
         frames = []
         for key in keys:
             try:
                 df = self._read_parquet_from_s3(key)
-                # Filter to requested pairs
-                mask = df.apply(
-                    lambda row: (row["entity_id_1"], row["entity_id_2"]) in pair_set
-                    or (row["entity_id_2"], row["entity_id_1"]) in pair_set,
-                    axis=1,
-                )
-                filtered = df[mask]
-                if not filtered.empty:
-                    frames.append(filtered)
             except Exception as e:
                 logger.error(f"Error reading {key}: {e}")
-                continue
+                raise OfflineStoreError(f"cannot read offline object {key}: {type(e).__name__}") from e
+            filtered = df[df["pair_id"].isin(wanted)]
+            if not filtered.empty:
+                frames.append(filtered)
 
         if not frames:
             return pd.DataFrame()
@@ -229,8 +202,13 @@ class OfflineFeatureStore:
         # compare both sides as UTC-aware so either form works.
         computed_at_utc = pd.to_datetime(combined["computed_at"], utc=True)
         combined = combined[computed_at_utc <= pd.Timestamp(as_of, tz="UTC")]
+        # Only the requested feature catalog version: rows of another version are a
+        # different feature definition and must not be mixed into one training set.
+        if request.feature_version:
+            combined = combined[combined["feature_version"] == request.feature_version]
         combined = combined.sort_values("computed_at", ascending=False)
-        combined = combined.drop_duplicates(subset=["entity_id_1", "entity_id_2"], keep="first")
+        # pair_id is order-independent, so A:B and B:A are one pair.
+        combined = combined.drop_duplicates(subset=["pair_id"], keep="first")
 
         logger.info(
             f"Retrieved {len(combined)} point-in-time feature vectors "
@@ -364,9 +342,72 @@ class OfflineFeatureStore:
                     if start_dt <= partition_dt <= end_dt:
                         keys.append(key)
         except (BotoCoreError, ClientError) as e:
+            # Used to be logged and answered with an empty list — "no features".
             logger.error(f"S3 LIST error: {e}")
+            raise OfflineStoreError(f"cannot list offline store: {type(e).__name__}") from e
 
         return sorted(keys)
+
+    def ping(self) -> bool:
+        """True if the offline bucket is reachable (real check for the health endpoint)."""
+        try:
+            self._s3.head_bucket(Bucket=self._bucket)
+            return True
+        except (BotoCoreError, ClientError) as e:
+            logger.warning(f"Offline store not reachable: {type(e).__name__}")
+            return False
+
+    def existing_vectors(
+        self,
+        tenant_id: str,
+        feature_version: str,
+        source_id: str,
+    ) -> dict:
+        """
+        Vectors already stored for this tenant that were computed from EXACTLY this
+        input (`source_id`) under this feature catalog version, as
+        {pair_id: FeatureVector} (latest per pair).
+
+        This is what makes materialization idempotent and resumable: a repeated or
+        restarted job reuses these instead of writing duplicates, and can restore the
+        online store from them without recomputing. Raises OfflineStoreError on any
+        list/read failure — a partial answer would cause silent recomputation.
+        """
+        prefix = f"{self._prefix}/{tenant_id}/"
+        latest: dict = {}
+        try:
+            paginator = self._s3.get_paginator("list_objects_v2")
+            keys = [
+                obj["Key"]
+                for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix)
+                for obj in page.get("Contents", [])
+            ]
+            for key in sorted(keys):
+                meta = self._s3.head_object(Bucket=self._bucket, Key=key).get("Metadata", {})
+                if meta.get("source_id") != source_id or meta.get("feature_version") != feature_version:
+                    continue
+                df = self._read_parquet_from_s3(key)
+                df = df[(df["tenant_id"] == tenant_id) & (df["feature_version"] == feature_version)]
+                for row in df.to_dict("records"):
+                    computed_at = pd.Timestamp(row["computed_at"])
+                    if computed_at.tzinfo is not None:
+                        computed_at = computed_at.tz_convert("UTC").tz_localize(None)
+                    computed_at = computed_at.to_pydatetime()
+                    current = latest.get(row["pair_id"])
+                    if current is not None and current.computed_at >= computed_at:
+                        continue
+                    latest[row["pair_id"]] = FeatureVector(
+                        entity_id_1=row["entity_id_1"],
+                        entity_id_2=row["entity_id_2"],
+                        tenant_id=row["tenant_id"],
+                        features={n: float(row[f"feat_{n}"]) for n in FEATURE_COLUMN_NAMES},
+                        feature_version=row["feature_version"],
+                        computed_at=computed_at,
+                        computation_ms=float(row.get("computation_ms") or 0.0),
+                    )
+        except (BotoCoreError, ClientError) as e:
+            raise OfflineStoreError(f"cannot scan offline store: {type(e).__name__}") from e
+        return latest
 
     def _read_parquet_from_s3(self, key: str) -> pd.DataFrame:
         """Read a single Parquet file from S3."""

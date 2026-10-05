@@ -30,13 +30,31 @@ from src.domain.models import (
 from src.repositories.online_store import OnlineFeatureStore
 from src.repositories.offline_store import FEATURE_COLUMN_NAMES, OfflineFeatureStore
 from src.repositories.feature_registry import FeatureRegistryRepository
-from src.services.feature_computation import FeatureComputationService
+from src.domain.feature_catalog import is_canonical, non_canonical_names
+from src.services.feature_computation import EmbeddingUnavailableError, FeatureComputationService
+from src.workers.job_lock import InProcessJobLock, JobLock, PostgresJobLock
 
 logger = logging.getLogger(__name__)
 
 
 class MaterializationFailed(RuntimeError):
     """A store write failed; the job must not report COMPLETED."""
+
+
+class MaterializationAlreadyRunning(RuntimeError):
+    """Another job holds the lock for this tenant (or for all tenants)."""
+
+
+INTERRUPTED_MESSAGE = (
+    "Interrupted: the service stopped while this job was running. Start a new job — "
+    "vectors already written are reused, not recomputed."
+)
+
+
+def pair_id_of(entity_id_1: str, entity_id_2: str) -> str:
+    """Order-independent pair id, identical to the offline store's pair_id column."""
+    a, b = sorted((entity_id_1, entity_id_2))
+    return f"{a}:{b}"
 
 
 class MaterializationWorker:
@@ -47,11 +65,22 @@ class MaterializationWorker:
     training) and the online store (Redis).
 
     Job contract:
-      COMPLETED  every successfully computed vector was written to both stores.
-                 Pairs whose computation failed, or that the source could not resolve,
-                 are counted (failed_entities / skipped_entities) and logged.
-      FAILED     no source configured, a store write failed, or not a single pair
-                 could be materialized. error_message says which.
+      COMPLETED  every pair the source resolved has a vector in both stores. Pairs
+                 whose computation failed, or that the source could not resolve, are
+                 counted (failed_entities / skipped_entities) and logged.
+      FAILED     no source configured, another job is running for the tenant, a store
+                 read/write failed, or not a single pair could be materialized.
+                 error_message says which.
+
+    Idempotent and resumable: when the source declares a `source_id` (the exact input,
+    e.g. a dataset id), a pair that already has an offline vector computed from that
+    same input under the current feature version is NOT recomputed and NOT written to
+    the offline store again — the stored vector is copied to the online store. So
+    running a job twice leaves one offline row per pair, a job restarted after a crash
+    continues where the first one stopped, and an emptied online store is restored
+    without recomputation.
+
+    One job per tenant: the JobLock is held for the whole run.
 
     The worker knows nothing about where pairs come from — see
     src/adapters/materialization_sources.py.
@@ -64,32 +93,47 @@ class MaterializationWorker:
         computation_service: FeatureComputationService,
         registry: FeatureRegistryRepository,
         source: Optional[MaterializationSource] = None,
+        lock: Optional[JobLock] = None,
     ):
         self._online = online_store
         self._offline = offline_store
         self._compute = computation_service
         self._registry = registry
         self._source = source
+        self._lock = lock or InProcessJobLock()
+        self.reused = 0   # vectors taken from the offline store instead of recomputed
 
     async def run_job(self, job: MaterializationJob) -> MaterializationJob:
         start_time = datetime.utcnow()
-        job.status = MaterializationStatus.RUNNING
-        job.started_at = start_time
         job.error_message = None
         ACTIVE_MATERIALIZATION_JOBS.inc()
 
         processed = failed = skipped = 0
+        self.reused = 0
+        handle = None
         try:
+            handle = await self._lock.acquire(job.tenant_id)
+            if handle is None:
+                raise MaterializationAlreadyRunning(
+                    f"Another materialization job is already running for "
+                    f"{'tenant ' + job.tenant_id if job.tenant_id else 'all tenants'}; "
+                    f"this job was not started."
+                )
+            job.status = MaterializationStatus.RUNNING
+            job.started_at = start_time
             await self._persist(job)
             if self._source is None:
                 raise MaterializationSourceNotConfigured(
                     "No materialization data source is configured."
                 )
+            source_id = getattr(self._source, "source_id", None)
             logger.info(
                 f"Materialization job {job.job_id} started "
-                f"(source={self._source.name}, tenant={job.tenant_id or 'all'})"
+                f"(source={self._source.name}, source_id={source_id or 'none'}, "
+                f"tenant={job.tenant_id or 'all'})"
             )
 
+            existing_by_tenant: dict = {}
             batches = self._source.iter_batches(
                 job.tenant_id, job.lookback_days, settings.MATERIALIZATION_BATCH_SIZE
             )
@@ -101,27 +145,47 @@ class MaterializationWorker:
                         f"(tenant {sk.tenant_id}) — {sk.reason}"
                     )
 
+                # Vectors this exact input already produced (idempotency / resume).
+                if source_id and batch.tenant_id not in existing_by_tenant:
+                    existing_by_tenant[batch.tenant_id] = await asyncio.to_thread(
+                        self._load_existing, batch.tenant_id, source_id
+                    )
+                existing = existing_by_tenant.get(batch.tenant_id, {})
+                reuse = [
+                    existing[pid] for e1, e2 in batch.pairs
+                    if (pid := pair_id_of(e1.entity_id, e2.entity_id)) in existing
+                    and e1.tenant_id == batch.tenant_id and e2.tenant_id == batch.tenant_id
+                ]
+                todo = PairBatch(tenant_id=batch.tenant_id, pairs=[
+                    (e1, e2) for e1, e2 in batch.pairs
+                    if pair_id_of(e1.entity_id, e2.entity_id) not in existing
+                    or e1.tenant_id != batch.tenant_id or e2.tenant_id != batch.tenant_id
+                ])
+
                 # CPU-bound (~75 ms/pair with embeddings): run off the event loop so
                 # the service keeps answering requests while a job runs.
-                vectors, batch_failed = await asyncio.to_thread(self._compute_batch, batch)
+                vectors, batch_failed = await asyncio.to_thread(self._compute_batch, todo)
                 failed += batch_failed
 
                 if vectors:
-                    self._write_offline(vectors, batch.tenant_id, processed)
-                    await self._write_online(vectors, batch.tenant_id, processed)
-                processed += len(vectors)
+                    self._write_offline(vectors, batch.tenant_id, processed, source_id)
+                if vectors or reuse:
+                    await self._write_online(vectors + reuse, batch.tenant_id, processed)
+                processed += len(vectors) + len(reuse)
+                self.reused += len(reuse)
 
                 # Per-batch deltas. (Previously the running totals were re-added every
                 # batch, inflating these counters.)
                 MATERIALIZATION_RECORDS.labels(status="success").inc(len(vectors))
+                MATERIALIZATION_RECORDS.labels(status="reused").inc(len(reuse))
                 MATERIALIZATION_RECORDS.labels(status="failed").inc(batch_failed)
                 MATERIALIZATION_RECORDS.labels(status="skipped").inc(len(batch.skipped))
 
                 self._set_counts(job, processed, failed, skipped)
                 await self._persist(job)
                 logger.info(
-                    f"Job {job.job_id}: tenant {batch.tenant_id} — {processed} written, "
-                    f"{failed} failed, {skipped} skipped so far"
+                    f"Job {job.job_id}: tenant {batch.tenant_id} — {processed} in both stores "
+                    f"({self.reused} reused), {failed} failed, {skipped} skipped so far"
                 )
 
             if processed == 0 and (failed or skipped):
@@ -142,7 +206,7 @@ class MaterializationWorker:
             job.status = MaterializationStatus.COMPLETED
 
         except (MaterializationFailed, MaterializationSourceNotConfigured,
-                MaterializationSourceError) as e:
+                MaterializationSourceError, MaterializationAlreadyRunning) as e:
             job.status = MaterializationStatus.FAILED
             job.error_message = str(e)
             logger.error(f"Materialization job {job.job_id} FAILED: {e}")
@@ -152,26 +216,46 @@ class MaterializationWorker:
             logger.error(f"Materialization job {job.job_id} FAILED: {e}", exc_info=True)
         finally:
             self._set_counts(job, processed, failed, skipped)
+            job.started_at = job.started_at or start_time
             job.completed_at = datetime.utcnow()
             duration = (job.completed_at - start_time).total_seconds()
             MATERIALIZATION_DURATION.labels(job_name="entity_features").observe(duration)
             ACTIVE_MATERIALIZATION_JOBS.dec()
-            await self._persist(job)
+            try:
+                await self._persist(job)
+            finally:
+                await self._lock.release(handle)
             logger.info(
-                f"Materialization job {job.job_id} {job.status.value}: {processed} written, "
-                f"{failed} failed, {skipped} skipped in {duration:.1f}s"
+                f"Materialization job {job.job_id} {job.status.value}: {processed} in both "
+                f"stores ({self.reused} reused), {failed} failed, {skipped} skipped in {duration:.1f}s"
             )
 
         return job
 
     # ── helpers ───────────────────────────────────────────────────────────
 
+    def _load_existing(self, tenant_id: str, source_id: str) -> dict:
+        try:
+            existing = self._offline.existing_vectors(tenant_id, settings.FEATURE_VERSION, source_id)
+        except Exception as ex:
+            # Not knowing what is already stored must stop the job: carrying on would
+            # write every vector a second time.
+            raise MaterializationFailed(
+                f"Could not read existing offline vectors for tenant {tenant_id}: "
+                f"{type(ex).__name__}: {ex}"
+            ) from ex
+        if existing:
+            logger.info(
+                f"Tenant {tenant_id}: {len(existing)} vectors already stored for source "
+                f"{source_id}; they will be reused"
+            )
+        return existing
+
     def _compute_batch(self, batch: PairBatch) -> Tuple[List[FeatureVector], int]:
         """Compute vectors for one single-tenant batch. Returns (vectors, n_failed).
         Runs in a worker thread."""
         vectors: List[FeatureVector] = []
         failed = 0
-        canonical = set(FEATURE_COLUMN_NAMES)
         for e1, e2 in batch.pairs:
             if e1.tenant_id != batch.tenant_id or e2.tenant_id != batch.tenant_id:
                 # Sources must never produce this; refuse rather than mis-file it.
@@ -183,6 +267,11 @@ class MaterializationWorker:
                 continue
             try:
                 fv = self._compute.compute(e1, e2, settings.FEATURE_VERSION)
+            except EmbeddingUnavailableError as ex:
+                # Not a property of this pair: every pair would fail the same way.
+                raise MaterializationFailed(
+                    f"Embedding model unavailable — no semantic features can be computed: {ex}"
+                ) from ex
             except Exception as ex:
                 logger.warning(
                     f"Feature computation failed for {e1.entity_id}:{e2.entity_id}: "
@@ -190,22 +279,23 @@ class MaterializationWorker:
                 )
                 failed += 1
                 continue
-            # A feature group that raised inside compute() is replaced by *_err_*
-            # names. That vector has 50 values but the wrong layout: never store it.
-            if set(fv.features) != canonical:
-                bad = sorted(set(fv.features) - canonical)[:3]
+            # compute() guarantees the catalog; checked again because a vector with
+            # other names must never reach a store.
+            if not is_canonical(fv.features.keys()):
                 logger.warning(
                     f"Non-canonical feature names for {e1.entity_id}:{e2.entity_id} "
-                    f"(e.g. {bad}); not stored"
+                    f"(e.g. {non_canonical_names(fv.features.keys())[:3]}); not stored"
                 )
                 failed += 1
                 continue
             vectors.append(fv)
         return vectors, failed
 
-    def _write_offline(self, vectors: List[FeatureVector], tenant_id: str, already: int) -> None:
+    def _write_offline(self, vectors: List[FeatureVector], tenant_id: str, already: int,
+                       source_id: Optional[str] = None) -> None:
         try:
-            self._offline.write_features(vectors, data_source=self._source.name)
+            self._offline.write_features(
+                vectors, data_source=self._source.name, source_id=source_id)
         except Exception as ex:
             raise MaterializationFailed(
                 f"Offline store write failed for tenant {tenant_id} "
@@ -214,7 +304,8 @@ class MaterializationWorker:
             ) from ex
 
     async def _write_online(self, vectors: List[FeatureVector], tenant_id: str, already: int) -> None:
-        written = await self._online.set_batch(vectors)
+        written = await self._online.set_batch(
+            vectors, ttl_hours=settings.MATERIALIZED_FEATURE_TTL_HOURS)
         if written != len(vectors):
             # set_batch reports Redis errors as a short count rather than raising.
             raise MaterializationFailed(
@@ -234,10 +325,18 @@ class MaterializationWorker:
         await self._registry.commit()
 
 
+def default_job_lock() -> JobLock:
+    """The cross-process lock (PostgreSQL advisory locks on the registry database)."""
+    from src.repositories.feature_registry import get_engine
+
+    return PostgresJobLock(get_engine())
+
+
 async def run_materialization_job(
     job: MaterializationJob,
     online_store: Optional[OnlineFeatureStore],
     computation_service: FeatureComputationService,
+    lock: Optional[JobLock] = None,
 ) -> MaterializationJob:
     """
     The single entry point for running a job, used by BOTH the API and the scheduler.
@@ -279,8 +378,41 @@ async def run_materialization_job(
             computation_service=computation_service,
             registry=registry,
             source=source,
+            lock=lock or default_job_lock(),
         )
         return await worker.run_job(job)
+
+
+async def recover_interrupted_jobs(
+    registry: FeatureRegistryRepository,
+    lock: JobLock,
+    pending_grace_seconds: int = 120,
+) -> List[MaterializationJob]:
+    """
+    Mark jobs that are recorded as RUNNING/PENDING but that nobody is running as FAILED.
+
+    A job that is really running holds its tenant lock, so "the lock is free" proves the
+    process that owned the job is gone. Without this a job interrupted by a restart
+    stayed RUNNING forever. PENDING jobs get a grace period: one created a moment ago
+    may simply not have taken its lock yet.
+    Returns the jobs it closed.
+    """
+    closed: List[MaterializationJob] = []
+    for job in await registry.list_unfinished_jobs(pending_grace_seconds):
+        handle = await lock.acquire(job.tenant_id)
+        if handle is None:
+            continue          # somebody holds the lock: the job is alive
+        try:
+            job.status = MaterializationStatus.FAILED
+            job.error_message = INTERRUPTED_MESSAGE
+            job.completed_at = datetime.utcnow()
+            await registry.save_materialization_job(job)
+            await registry.commit()
+            closed.append(job)
+            logger.warning(f"Materialization job {job.job_id} marked FAILED: interrupted by a restart")
+        finally:
+            await lock.release(handle)
+    return closed
 
 
 # ─── Drift Detection Worker ───────────────────────────────────────────────────

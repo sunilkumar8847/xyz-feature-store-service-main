@@ -131,6 +131,11 @@ class Settings(BaseSettings):
     FEATURE_TTL_HOURS: int = 24
     FEATURE_BATCH_SIZE: int = 100
     FEATURE_VECTOR_DIM: int = 50
+    # Expiry of vectors written by MATERIALIZATION, in hours. 0 = no expiry: they are
+    # the authoritative online copy and are replaced by the next materialization or
+    # removed when an entity changes. (They used to expire after FEATURE_TTL_HOURS with
+    # nothing refreshing them, so serving stopped a day after every materialization.)
+    MATERIALIZED_FEATURE_TTL_HOURS: float = 0
     MATERIALIZATION_CRON: str = "0 2 * * *"  # Daily at 2 AM UTC
     MATERIALIZATION_LOOKBACK_DAYS: int = 30
     CACHE_HIT_WARN_THRESHOLD: float = 0.9  # Alert if < 90% cache hit
@@ -148,8 +153,27 @@ class Settings(BaseSettings):
     # Output of `python -m synthetic_data` (entities.parquet, pairs.parquet, manifest.json).
     SYNTHETIC_DATA_DIR: Optional[str] = None
 
+    # ─── Bootstrap mode ──────────────────────────────────────────────
+    # The company-owned synthetic SEED corpus may be materialized outside
+    # development/test ONLY when BOTH are set:
+    #   BOOTSTRAP_MODE=true
+    #   BOOTSTRAP_DATASET_MANIFEST_SHA256=<sha256 of the corpus's manifest.json>[,<sha256>...]
+    # The manifest hash pins the exact files (the manifest records their hashes), so an
+    # arbitrary synthetic directory is still refused in staging/production.
+    BOOTSTRAP_MODE: bool = False
+    BOOTSTRAP_DATASET_MANIFEST_SHA256: str = ""
+
+    @property
+    def bootstrap_manifest_allowlist(self) -> frozenset:
+        return frozenset(
+            h.strip().lower() for h in self.BOOTSTRAP_DATASET_MANIFEST_SHA256.split(",") if h.strip()
+        )
+
     # ─── Embedding Model ─────────────────────────────────────────────
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
+    # Hugging Face revision (commit hash) to pin. None = whatever is cached/latest;
+    # pin it in staging/production so the semantic features cannot change silently.
+    EMBEDDING_MODEL_REVISION: Optional[str] = None
     EMBEDDING_BATCH_SIZE: int = 32
     EMBEDDING_CACHE_SIZE: int = 10000  # LRU cache entries
 
@@ -198,10 +222,19 @@ def check_materialization_source(s: "Settings") -> None:
         )
     if source == "synthetic":
         if s.ENVIRONMENT not in SYNTHETIC_DATA_ENVIRONMENTS:
-            raise ValueError(
-                f"MATERIALIZATION_SOURCE=synthetic is not permitted with "
-                f"ENVIRONMENT={s.ENVIRONMENT.value}; synthetic data is development/test only."
-            )
+            if not s.BOOTSTRAP_MODE:
+                raise ValueError(
+                    f"MATERIALIZATION_SOURCE=synthetic is not permitted with "
+                    f"ENVIRONMENT={s.ENVIRONMENT.value}. Synthetic data is development/test "
+                    f"only, unless the pinned seed corpus is enabled explicitly with "
+                    f"BOOTSTRAP_MODE=true and BOOTSTRAP_DATASET_MANIFEST_SHA256."
+                )
+            if not s.bootstrap_manifest_allowlist:
+                raise ValueError(
+                    "BOOTSTRAP_MODE=true requires BOOTSTRAP_DATASET_MANIFEST_SHA256: the "
+                    "sha256 of the seed corpus's manifest.json. Bootstrap mode never "
+                    "accepts an unpinned synthetic directory."
+                )
         if not s.SYNTHETIC_DATA_DIR:
             raise ValueError(
                 "MATERIALIZATION_SOURCE=synthetic requires SYNTHETIC_DATA_DIR "

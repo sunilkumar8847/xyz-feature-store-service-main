@@ -100,27 +100,19 @@ class TestAuth:
     def test_valid_headers_pass_auth(self, client):
         with patch("src.services.feature_store.FeatureStoreService.get_features") as mock_svc:
             mock_svc.return_value = _make_feature_vector()
-            r = client.get(
-                "/api/v1/features/ent_001/ent_002",
-                headers=AUTH_HEADERS,
-                params={"tenant_id": TENANT_ID, "name1": "Alice", "name2": "Alise"},
-            )
-            assert r.status_code in (200, 500)
+            r = client.get("/api/v1/features/ent_001/ent_002", headers=AUTH_HEADERS)
+            assert r.status_code == 200
 
 
 class TestFeatureRetrieval:
     def test_get_features_returns_50_features(self, client):
         with patch("src.services.feature_store.FeatureStoreService.get_features") as mock_svc:
             mock_svc.return_value = _make_feature_vector()
-            r = client.get(
-                "/api/v1/features/ent_001/ent_002",
-                headers=AUTH_HEADERS,
-                params={"tenant_id": TENANT_ID, "name1": "Alice", "name2": "Alise"},
-            )
-            if r.status_code == 200:
-                d = r.json()
-                assert "features" in d
-                assert len(d["features"]) == 50
+            r = client.get("/api/v1/features/ent_001/ent_002", headers=AUTH_HEADERS)
+            assert r.status_code == 200
+            d = r.json()
+            assert len(d["features"]) == 50
+            assert len(d["feature_vector"]) == 50
 
     def test_batch_endpoint_validates_max_size(self, client):
         pairs = [
@@ -149,15 +141,16 @@ class TestMaterializationEndpoint:
         assert r.status_code == 401
 
     def test_materialize_with_auth(self, client):
-        with patch("src.services.feature_store.FeatureStoreService.trigger_materialization") as mock_svc:
-            mock_job = MaterializationJob(triggered_by="api")
+        with patch("src.services.feature_store.FeatureStoreService.trigger_materialization") as mock_svc,                 patch("src.services.feature_store.FeatureStoreService.find_active_job", return_value=None),                 patch("src.api.v1.endpoints.features.run_materialization_job", new=AsyncMock()):
+            mock_job = MaterializationJob(triggered_by="api", tenant_id=TENANT_ID)
             mock_svc.return_value = mock_job
             r = client.post(
                 "/api/v1/materialize",
                 json={"tenant_id": TENANT_ID},
                 headers=AUTH_HEADERS,
             )
-            assert r.status_code in (202, 500)
+            assert r.status_code == 202
+            assert r.json()["tenant_id"] == TENANT_ID
 
 
 class TestHealthEndpoint:

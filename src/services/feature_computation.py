@@ -27,6 +27,7 @@ import jellyfish
 import numpy as np
 from rapidfuzz import fuzz, distance
 
+from src.domain.feature_catalog import FEATURE_COUNT, is_canonical, non_canonical_names
 from src.domain.models import EntitySnapshot, FeatureVector
 from src.core.config import settings
 from src.core.metrics import PHONETIC_ENCODER_FALLBACKS
@@ -34,23 +35,72 @@ from src.core.metrics import PHONETIC_ENCODER_FALLBACKS
 logger = logging.getLogger(__name__)
 
 
-# ─── Embedding Model (singleton, thread-safe) ────────────────────────────────
+# ─── Errors ──────────────────────────────────────────────────────────────────
+
+class FeatureComputationError(RuntimeError):
+    """
+    A feature vector could not be computed. Raised instead of returning a vector with
+    substituted values: a zero is a legitimate feature value ("no similarity"), so a
+    zero standing in for "computation failed" is indistinguishable from real evidence
+    and silently corrupts both training and serving.
+    """
+
+    def __init__(self, group: str, detail: str):
+        self.group = group
+        self.detail = detail
+        super().__init__(f"feature computation failed in group '{group}': {detail}")
+
+
+class EmbeddingUnavailableError(FeatureComputationError):
+    """The sentence-embedding model is missing or cannot produce an embedding."""
+
+    def __init__(self, detail: str):
+        super().__init__("semantic", detail)
+
+
+# ─── Embedding Model (singleton) ─────────────────────────────────────────────
 
 _embedding_model = None
 
 
 def get_embedding_model():
-    """Lazy-load the sentence transformer model."""
+    """
+    The sentence-transformer model, loaded once. Raises EmbeddingUnavailableError if it
+    cannot be loaded. It used to log a warning and return None, after which all ten
+    sem_* features were served as 0.0 under their normal names.
+    """
     global _embedding_model
     if _embedding_model is None:
         try:
             from sentence_transformers import SentenceTransformer
-            _embedding_model = SentenceTransformer(settings.EMBEDDING_MODEL)
-            logger.info(f"Loaded embedding model: {settings.EMBEDDING_MODEL}")
+            kwargs = {}
+            if settings.EMBEDDING_MODEL_REVISION:
+                kwargs["revision"] = settings.EMBEDDING_MODEL_REVISION
+            _embedding_model = SentenceTransformer(settings.EMBEDDING_MODEL, **kwargs)
+            logger.info(
+                f"Loaded embedding model: {settings.EMBEDDING_MODEL} "
+                f"(revision {settings.EMBEDDING_MODEL_REVISION or 'unpinned'})"
+            )
         except Exception as e:
-            logger.warning(f"Failed to load embedding model: {e}. Using fallback.")
-            _embedding_model = None
+            raise EmbeddingUnavailableError(
+                f"cannot load embedding model {settings.EMBEDDING_MODEL!r}: "
+                f"{type(e).__name__}: {e}"
+            ) from e
     return _embedding_model
+
+
+def embedding_model_loaded() -> bool:
+    """True if the model is in memory. Does NOT trigger a load (safe for health checks)."""
+    return _embedding_model is not None
+
+
+def embedding_model_ready() -> bool:
+    """True if the embedding model is loaded (loading it if necessary)."""
+    try:
+        return get_embedding_model() is not None
+    except EmbeddingUnavailableError as e:
+        logger.error(str(e))
+        return False
 
 
 # ─── String Normalisation Helpers ────────────────────────────────────────────
@@ -286,14 +336,18 @@ class SemanticFeatures:
 
     @staticmethod
     def _embed(text: str) -> Optional[np.ndarray]:
-        model = get_embedding_model()
-        if model is None or not text:
+        """
+        Embedding of `text`, or None when the text is EMPTY (a record with no name or
+        address — a defined case: the comparison scores 0.0). A missing model or a
+        failed encode is not that case and raises.
+        """
+        if not text:
             return None
+        model = get_embedding_model()
         try:
             return model.encode(text, normalize_embeddings=True)
         except Exception as e:
-            logger.debug(f"Embedding failed: {e}")
-            return None
+            raise EmbeddingUnavailableError(f"encode failed: {type(e).__name__}: {e}") from e
 
     @staticmethod
     def _cosine(v1: np.ndarray, v2: np.ndarray) -> float:
@@ -471,67 +525,54 @@ class FeatureComputationService:
         self,
         entity1: EntitySnapshot,
         entity2: EntitySnapshot,
-        feature_version: str = "v2.0.0",
+        feature_version: Optional[str] = None,
     ) -> FeatureVector:
         """
         Compute all 50 features for an entity pair.
-        Returns a FeatureVector with exactly 50 named features.
+        Returns a FeatureVector with exactly the 50 catalog features, or raises
+        FeatureComputationError. It never returns substituted values.
         """
+        feature_version = feature_version or settings.FEATURE_VERSION
+        if feature_version != settings.FEATURE_VERSION:
+            # The code computes ONE catalog version; labelling its output as another
+            # would let two different feature definitions share a version string.
+            raise FeatureComputationError(
+                "catalog",
+                f"requested feature_version {feature_version!r} but this service "
+                f"computes {settings.FEATURE_VERSION!r}",
+            )
         start = time.perf_counter()
 
         features: Dict[str, float] = {}
 
-        # 1. String Similarity (15 features)
-        try:
-            features.update(self._string_computer.compute(entity1, entity2))
-        except Exception as e:
-            logger.error(f"String similarity computation failed: {e}")
-            features.update({f"ss_err_{i}": 0.0 for i in range(15)})
+        groups = (
+            ("string_similarity", self._string_computer),
+            ("phonetic", self._phonetic_computer),
+            ("token", self._token_computer),
+            ("semantic", self._semantic_computer),
+            ("structural", self._structural_computer),
+            ("domain", self._domain_computer),
+        )
+        for group, computer in groups:
+            try:
+                features.update(computer.compute(entity1, entity2))
+            except FeatureComputationError:
+                raise
+            except Exception as e:
+                # Previously: log, then substitute 0.0 under placeholder names
+                # (ss_err_0, ph_err_0, ...) and return the vector as if it were valid.
+                raise FeatureComputationError(group, f"{type(e).__name__}: {e}") from e
 
-        # 2. Phonetic (5 features)
-        try:
-            features.update(self._phonetic_computer.compute(entity1, entity2))
-        except Exception as e:
-            logger.error(f"Phonetic computation failed: {e}")
-            features.update({f"ph_err_{i}": 0.0 for i in range(5)})
-
-        # 3. Token-based (8 features)
-        try:
-            features.update(self._token_computer.compute(entity1, entity2))
-        except Exception as e:
-            logger.error(f"Token computation failed: {e}")
-            features.update({f"tk_err_{i}": 0.0 for i in range(8)})
-
-        # 4. Semantic (10 features)
-        try:
-            features.update(self._semantic_computer.compute(entity1, entity2))
-        except Exception as e:
-            logger.error(f"Semantic computation failed: {e}")
-            features.update({f"sem_err_{i}": 0.0 for i in range(10)})
-
-        # 5. Structural (7 features)
-        try:
-            features.update(self._structural_computer.compute(entity1, entity2))
-        except Exception as e:
-            logger.error(f"Structural computation failed: {e}")
-            features.update({f"str_err_{i}": 0.0 for i in range(7)})
-
-        # 6. Domain-specific (5 features)
-        try:
-            features.update(self._domain_computer.compute(entity1, entity2))
-        except Exception as e:
-            logger.error(f"Domain computation failed: {e}")
-            features.update({f"dom_err_{i}": 0.0 for i in range(5)})
-
-        # Ensure exactly 50 features
-        actual_count = len(features)
-        if actual_count != self.EXPECTED_FEATURE_COUNT:
-            logger.warning(
-                f"Expected {self.EXPECTED_FEATURE_COUNT} features, got {actual_count}. "
-                f"Padding with zeros."
+        # The vector must be exactly the catalog. It used to be padded with pad_N = 0.0.
+        if not is_canonical(features.keys()):
+            raise FeatureComputationError(
+                "catalog",
+                f"computed {len(features)} features that do not match the "
+                f"{FEATURE_COUNT}-feature catalog (e.g. {non_canonical_names(features.keys())[:3]})",
             )
-            for i in range(actual_count, self.EXPECTED_FEATURE_COUNT):
-                features[f"pad_{i}"] = 0.0
+        bad = sorted(k for k, v in features.items() if v is None or not math.isfinite(v))
+        if bad:
+            raise FeatureComputationError("catalog", f"non-finite values for {bad[:3]}")
 
         # Clip all to [0, 1] range
         features = {k: max(0.0, min(1.0, v)) for k, v in features.items()}

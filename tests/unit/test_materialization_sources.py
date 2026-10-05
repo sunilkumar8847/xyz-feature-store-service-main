@@ -50,11 +50,27 @@ def generated(tmp_path_factory):
     return out, records, pairs
 
 
+def seal(path: Path, manifest: dict) -> dict:
+    """Give a hand-built dataset a valid identity: file hashes + dataset_id, computed
+    the way the generator does. (Datasets without an identity are refused.)"""
+    import hashlib
+
+    def sha(p):
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+
+    identity = {"source": "synthetic", "label_source": "synthetic", "note": "hand-built test dataset",
+                "files": {n: sha(path / n) for n in ("entities.parquet", "pairs.parquet")}}
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    manifest = dict(manifest)
+    manifest["identity"] = identity
+    manifest["dataset_id"] = "synds-" + hashlib.sha256(canonical.encode("ascii")).hexdigest()[:16]
+    manifest["file_sha256"] = dict(identity["files"])
+    return manifest
+
+
 def _write_minimal(path: Path, entities, pairs, manifest=None) -> Path:
     path.mkdir(parents=True, exist_ok=True)
-    (path / "manifest.json").write_text(json.dumps(manifest if manifest is not None else {
-        "source": "synthetic", "is_production_data": False, "generated_at": GENERATED_AT,
-    }), encoding="utf-8")
+    _manifest_given = manifest
     pq.write_table(pa.Table.from_pylist([
         {"entity_id": e, "tenant_id": t, "entity_type": "customer", "fields_json": json.dumps(f)}
         for e, t, f in entities
@@ -62,6 +78,12 @@ def _write_minimal(path: Path, entities, pairs, manifest=None) -> Path:
     pq.write_table(pa.Table.from_pylist([
         {"entity_id_1": a, "entity_id_2": b, "tenant_id": t} for a, b, t in pairs
     ]), path / "pairs.parquet")
+    # A caller-supplied manifest is written verbatim (those tests are about bad
+    # provenance); the default one is sealed with a valid identity.
+    manifest = _manifest_given if _manifest_given is not None else seal(path, {
+        "source": "synthetic", "is_production_data": False, "generated_at": GENERATED_AT,
+    })
+    (path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     return path
 
 

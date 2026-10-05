@@ -17,6 +17,7 @@ feature computation and both stores stay unchanged.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from abc import ABC, abstractmethod
@@ -25,7 +26,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
-from src.core.config import Settings, check_materialization_source
+from src.core.config import (
+    SYNTHETIC_DATA_ENVIRONMENTS, Settings, check_materialization_source, settings as _settings,
+)
 from src.domain.models import EntitySnapshot
 
 logger = logging.getLogger(__name__)
@@ -54,12 +57,26 @@ class MaterializationSourceError(ValueError):
     """The source's input is missing, malformed or has the wrong provenance."""
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 class MaterializationSource(ABC):
     """Supplies entity pairs, as EntitySnapshot pairs, to MaterializationWorker."""
 
     #: Recorded as object metadata on every offline file this source produces, so the
     #: provenance of stored features is never ambiguous.
     name: str = "unknown"
+
+    #: Identity of the EXACT input this source reads (e.g. a dataset id that hashes its
+    #: content). Recorded on every offline file. When set, a repeated job reuses the
+    #: vectors already stored for the same source_id instead of recomputing them. None
+    #: means "no stable identity": every job recomputes everything.
+    source_id: Optional[str] = None
 
     @abstractmethod
     def iter_batches(
@@ -106,9 +123,12 @@ class SyntheticMaterializationSource(MaterializationSource):
     ENTITIES_FILE = "entities.parquet"
     PAIRS_FILE = "pairs.parquet"
 
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, settings: Optional[Settings] = None):
         self._dir = Path(data_dir)
+        self._settings = settings or _settings
         self.manifest = self._load_manifest()
+        self.manifest_sha256 = self._verify_identity(self.manifest)
+        self.source_id = self.manifest["dataset_id"]
         self._snapshot_at = self._parse_generated_at(self.manifest)
 
     # ── provenance ────────────────────────────────────────────────────────
@@ -135,6 +155,53 @@ class SyntheticMaterializationSource(MaterializationSource):
             if not (self._dir / required).is_file():
                 raise MaterializationSourceError(f"{self._dir / required} not found.")
         return manifest
+
+    def _verify_identity(self, manifest: dict) -> str:
+        """
+        The dataset must be exactly what its manifest says, and — outside
+        development/test — exactly a corpus that was pinned for bootstrap use.
+
+          * the manifest carries a dataset identity (generator >= 2.1.0)
+          * dataset_id is the hash of the identity block
+          * entities.parquet / pairs.parquet have the recorded sha256
+          * staging/production: sha256(manifest.json) is in
+            BOOTSTRAP_DATASET_MANIFEST_SHA256 (the manifest holds the file hashes, so
+            pinning it pins the data)
+
+        Returns sha256(manifest.json).
+        """
+        path = self._dir / self.MANIFEST_FILE
+        identity = manifest.get("identity")
+        if not identity or not manifest.get("dataset_id") or not manifest.get("file_sha256"):
+            raise MaterializationSourceError(
+                f"{path} has no dataset identity (generator "
+                f"{manifest.get('generator_version')!r}). Regenerate the dataset with "
+                f"`python -m synthetic_data` (generator >= 2.1.0)."
+            )
+        canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        expected_id = "synds-" + hashlib.sha256(canonical.encode("ascii")).hexdigest()[:16]
+        if manifest["dataset_id"] != expected_id:
+            raise MaterializationSourceError(
+                f"{path}: dataset_id {manifest['dataset_id']!r} does not match its identity block."
+            )
+        for name, expected in manifest["file_sha256"].items():
+            actual = _sha256_file(self._dir / name)
+            if actual != expected:
+                raise MaterializationSourceError(
+                    f"{self._dir / name}: content does not match the manifest "
+                    f"(sha256 {actual[:12]} != {expected[:12]}). The dataset was modified "
+                    f"after it was generated."
+                )
+        manifest_hash = _sha256_file(path)
+        s = self._settings
+        if s.ENVIRONMENT not in SYNTHETIC_DATA_ENVIRONMENTS:
+            if not s.BOOTSTRAP_MODE or manifest_hash not in s.bootstrap_manifest_allowlist:
+                raise MaterializationSourceError(
+                    f"{path} (sha256 {manifest_hash}) is not an approved bootstrap corpus for "
+                    f"ENVIRONMENT={s.ENVIRONMENT.value}. Only a dataset whose manifest hash is "
+                    f"listed in BOOTSTRAP_DATASET_MANIFEST_SHA256 may be used, with BOOTSTRAP_MODE=true."
+                )
+        return manifest_hash
 
     @staticmethod
     def _parse_generated_at(manifest: dict) -> datetime:
@@ -253,6 +320,6 @@ def build_materialization_source(s: Settings) -> MaterializationSource:
             "development set MATERIALIZATION_SOURCE=synthetic and SYNTHETIC_DATA_DIR."
         )
     if s.MATERIALIZATION_SOURCE == "synthetic":
-        return SyntheticMaterializationSource(s.SYNTHETIC_DATA_DIR)
+        return SyntheticMaterializationSource(s.SYNTHETIC_DATA_DIR, settings=s)
     # Unreachable: check_materialization_source rejects unknown values.
     raise MaterializationSourceError(f"Unsupported source {s.MATERIALIZATION_SOURCE!r}")
